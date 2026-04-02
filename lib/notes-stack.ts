@@ -54,6 +54,17 @@ export class NotesStack extends cdk.Stack {
     );
     repo.grantPull(executionRole);
 
+    // Explicit ECR permissions for pulling images
+    executionRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'ecr:GetAuthorizationToken',
+        'ecr:BatchCheckLayerAvailability',
+        'ecr:GetDownloadUrlForLayer',
+        'ecr:BatchGetImage',
+      ],
+      resources: ['*'],
+    }));
+
     // ─── 5. Security Groups ────────────────────────────────────
     const postgresSG = new ec2.SecurityGroup(this, 'PostgresSG', {
       vpc,
@@ -89,7 +100,7 @@ export class NotesStack extends cdk.Stack {
     });
 
     postgresTaskDef.addContainer('postgres', {
-      image: ecs.ContainerImage.fromRegistry('$postgres-16'),
+      image: ecs.ContainerImage.fromRegistry('postgres:16'),
       containerName: 'notes-postgres',
       environment: {
         POSTGRES_USER: 'postgres',
@@ -104,7 +115,7 @@ export class NotesStack extends cdk.Stack {
     });
 
     postgresTaskDef.addContainer('pgadmin', {
-      image: ecs.ContainerImage.fromRegistry('$pgadmin4-8'),
+      image: ecs.ContainerImage.fromRegistry('dpage/pgadmin4:8'),
       containerName: 'notes-pgadmin',
       environment: {
         PGADMIN_DEFAULT_EMAIL: 'admin@admin.com',
@@ -144,7 +155,8 @@ export class NotesStack extends cdk.Stack {
       image: ecs.ContainerImage.fromRegistry(`${ECR_REPO}:latest`),
       containerName: 'notes-api',
       environment: {
-        ASPNETCORE_ENVIRONMENT: 'Development',
+        ASPNETCORE_ENVIRONMENT: 'Development'
+    
       },
       portMappings: [{ containerPort: 8080 }],
       logging: ecs.LogDrivers.awsLogs({
@@ -152,7 +164,6 @@ export class NotesStack extends cdk.Stack {
         logRetention: logs.RetentionDays.ONE_WEEK,
       }),
     });
-
     // ─── 9. ALB ────────────────────────────────────────────────
     const alb = new elbv2.ApplicationLoadBalancer(this, 'NotesALB', {
       vpc,
