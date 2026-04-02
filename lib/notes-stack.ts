@@ -9,8 +9,8 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
-import * as efs from 'aws-cdk-lib/aws-efs';
 
 export class NotesStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -29,6 +29,11 @@ export class NotesStack extends cdk.Stack {
     const cluster = new ecs.Cluster(this, 'NotesCluster', {
       vpc,
       clusterName: 'notes-cluster',
+      defaultCloudMapNamespace: {
+        name: 'notes.local',  // internal DNS for service discovery
+        type: servicediscovery.NamespaceType.DNS_PRIVATE,
+        vpc,
+      },
     });
 
     // ─── 3. IAM Execution Role ─────────────────────────────────
@@ -49,16 +54,42 @@ export class NotesStack extends cdk.Stack {
     );
     repo.grantPull(executionRole);
 
-    // ─── 5. Task Definition ────────────────────────────────────
-    const taskDefinition = new ecs.FargateTaskDefinition(this, 'NotesTaskDef', {
-      memoryLimitMiB: 2048,
-      cpu: 1024,
+    // ─── 5. Security Groups ────────────────────────────────────
+    const postgresSG = new ec2.SecurityGroup(this, 'PostgresSG', {
+      vpc,
+      allowAllOutbound: true,
+      description: 'Security group for Postgres service',
+    });
+
+    const apiSG = new ec2.SecurityGroup(this, 'ApiSG', {
+      vpc,
+      allowAllOutbound: true,
+      description: 'Security group for API service',
+    });
+
+    // Allow API to talk to Postgres on port 5432
+    postgresSG.addIngressRule(
+      apiSG,
+      ec2.Port.tcp(5432),
+      'Allow API to connect to Postgres'
+    );
+
+    // Allow ALB to talk to API on port 8080
+    apiSG.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(8080),
+      'Allow ALB to API'
+    );
+
+    // ─── 6. Postgres Task Definition ───────────────────────────
+    const postgresTaskDef = new ecs.FargateTaskDefinition(this, 'PostgresTaskDef', {
+      memoryLimitMiB: 1024,
+      cpu: 512,
       executionRole,
     });
 
-    // ─── 6. Postgres Container ─────────────────────────────────
-    const postgresContainer = taskDefinition.addContainer('postgres', {
-      image: ecs.ContainerImage.fromRegistry(`${ECR_REPO}:postgres-16`),
+    postgresTaskDef.addContainer('postgres', {
+      image: ecs.ContainerImage.fromRegistry('$postgres-16'),
       containerName: 'notes-postgres',
       environment: {
         POSTGRES_USER: 'postgres',
@@ -72,30 +103,8 @@ export class NotesStack extends cdk.Stack {
       }),
     });
 
-
-
-    // ─── 7. API Container ──────────────────────────────────────
-    const apiContainer = taskDefinition.addContainer('api', {
-      image: ecs.ContainerImage.fromRegistry(`${ECR_REPO}:latest`),
-      containerName: 'notes-api',
-      environment: {
-        ASPNETCORE_ENVIRONMENT: 'Development',
-      },
-      portMappings: [{ containerPort: 8080 }],
-      logging: ecs.LogDrivers.awsLogs({
-        streamPrefix: 'api',
-        logRetention: logs.RetentionDays.ONE_WEEK,
-      }),
-    });
-
-    apiContainer.addContainerDependencies({
-      container: postgresContainer,
-      condition: ecs.ContainerDependencyCondition.START,
-    });
-
-    // ─── 8. pgAdmin Container ──────────────────────────────────
-    taskDefinition.addContainer('pgadmin', {
-      image: ecs.ContainerImage.fromRegistry(`${ECR_REPO}:pgadmin4-8`),
+    postgresTaskDef.addContainer('pgadmin', {
+      image: ecs.ContainerImage.fromRegistry('$pgadmin4-8'),
       containerName: 'notes-pgadmin',
       environment: {
         PGADMIN_DEFAULT_EMAIL: 'admin@admin.com',
@@ -108,13 +117,43 @@ export class NotesStack extends cdk.Stack {
       }),
     });
 
-    // ─── 9. Security Group ─────────────────────────────────────
-    const ecsSG = new ec2.SecurityGroup(this, 'EcsSG', {
-      vpc,
-      allowAllOutbound: true,
+    // ─── 7. Postgres Service ───────────────────────────────────
+    const postgresService = new ecs.FargateService(this, 'PostgresService', {
+      cluster,
+      taskDefinition: postgresTaskDef,
+      desiredCount: 1,
+      assignPublicIp: false,
+      securityGroups: [postgresSG],
+      serviceName: 'notes-postgres-service',
+      // Service discovery so API can reach postgres via DNS
+      cloudMapOptions: {
+        name: 'postgres',
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+        dnsTtl: cdk.Duration.seconds(10),
+      },
     });
 
-    // ─── 10. ALB ───────────────────────────────────────────────
+    // ─── 8. API Task Definition ────────────────────────────────
+    const apiTaskDef = new ecs.FargateTaskDefinition(this, 'ApiTaskDef', {
+      memoryLimitMiB: 1024,
+      cpu: 512,
+      executionRole,
+    });
+
+    apiTaskDef.addContainer('api', {
+      image: ecs.ContainerImage.fromRegistry(`${ECR_REPO}:latest`),
+      containerName: 'notes-api',
+      environment: {
+        ASPNETCORE_ENVIRONMENT: 'Development',
+      },
+      portMappings: [{ containerPort: 8080 }],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'api',
+        logRetention: logs.RetentionDays.ONE_WEEK,
+      }),
+    });
+
+    // ─── 9. ALB ────────────────────────────────────────────────
     const alb = new elbv2.ApplicationLoadBalancer(this, 'NotesALB', {
       vpc,
       internetFacing: true,
@@ -126,22 +165,22 @@ export class NotesStack extends cdk.Stack {
       open: true,
     });
 
-    // ─── 11. ECS Fargate Service ───────────────────────────────
-    const service = new ecs.FargateService(this, 'NotesService', {
+    // ─── 10. API Service ───────────────────────────────────────
+    const apiService = new ecs.FargateService(this, 'ApiService', {
       cluster,
-      taskDefinition,
-      desiredCount: 1,
+      taskDefinition: apiTaskDef,
+      desiredCount: 0,
       assignPublicIp: false,
-      securityGroups: [ecsSG],
-      serviceName: 'notes-service',
+      securityGroups: [apiSG],
+      serviceName: 'notes-api-service',
     });
 
-    // ─── 12. ALB Target Group ──────────────────────────────────
+    // ─── 11. ALB Target Group ──────────────────────────────────
     listener.addTargets('NotesTarget', {
       port: 8080,
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [
-        service.loadBalancerTarget({
+        apiService.loadBalancerTarget({
           containerName: 'notes-api',
           containerPort: 8080,
         }),
@@ -153,18 +192,10 @@ export class NotesStack extends cdk.Stack {
       },
     });
 
-    ecsSG.addIngressRule(
-      ec2.Peer.anyIpv4(),
-      ec2.Port.tcp(8080),
-      'Allow ALB to API'
-    );
-
-    // ─── 13. API GATEWAY ───────────────────────────────────────
+    // ─── 12. API GATEWAY ───────────────────────────────────────
     const api = new apigateway.RestApi(this, 'NotesApiGateway', {
       restApiName: 'notes-api-gateway',
       description: 'API Gateway for Notes Application',
-
-      // ✅ CORS — locked to CloudFront CDN only
       defaultCorsPreflightOptions: {
         allowOrigins: [CDN_ORIGIN],
         allowMethods: apigateway.Cors.ALL_METHODS,
@@ -180,8 +211,6 @@ export class NotesStack extends cdk.Stack {
         allowCredentials: true,
         maxAge: cdk.Duration.days(1),
       },
-
-      // ✅ Rate limiting: 10,000 req per 5 min = ~33 req/sec, burst 500
       deployOptions: {
         stageName: 'dev',
         throttlingRateLimit: 33,
@@ -192,7 +221,7 @@ export class NotesStack extends cdk.Stack {
       },
     });
 
-    // ─── ALB Integration (proxy all) ───────────────────────────
+    // ─── ALB Integration ───────────────────────────────────────
     const albIntegration = new apigateway.HttpIntegration(
       `http://${alb.loadBalancerDnsName}/{proxy}`,
       {
@@ -215,7 +244,6 @@ export class NotesStack extends cdk.Stack {
       }
     );
 
-    // ─── Resource 1: Proxy → ALB ───────────────────────────────
     const proxyResource = api.root.addResource('{proxy+}');
     proxyResource.addMethod('ANY', albIntegration, {
       requestParameters: {
@@ -233,7 +261,6 @@ export class NotesStack extends cdk.Stack {
       ],
     });
 
-    // ─── Resource 2: /scalar → ALB ─────────────────────────────
     const scalarIntegration = new apigateway.HttpIntegration(
       `http://${alb.loadBalancerDnsName}/scalar`,
       {
@@ -263,7 +290,6 @@ export class NotesStack extends cdk.Stack {
       ],
     });
 
-    // ─── Resource 3: /scalar/{proxy+} → ALB assets ─────────────
     const scalarProxyIntegration = new apigateway.HttpIntegration(
       `http://${alb.loadBalancerDnsName}/scalar/{proxy}`,
       {
@@ -299,7 +325,7 @@ export class NotesStack extends cdk.Stack {
       ],
     });
 
-    // ─── 14. S3 Bucket ─────────────────────────────────────────
+    // ─── 13. S3 Bucket ─────────────────────────────────────────
     const webBucket = new s3.Bucket(this, 'NotesWebBucket', {
       bucketName: `notes-webapp-${this.account}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -307,24 +333,16 @@ export class NotesStack extends cdk.Stack {
       autoDeleteObjects: true,
       cors: [
         {
-          // ✅ S3 CORS — allow CDN origin
           allowedOrigins: [CDN_ORIGIN],
           allowedMethods: [s3.HttpMethods.GET, s3.HttpMethods.HEAD],
-          allowedHeaders: [
-            'Origin',
-            'Content-Type',
-            'Accept',
-            'Authorization',
-          ],
+          allowedHeaders: ['Origin', 'Content-Type', 'Accept', 'Authorization'],
           exposedHeaders: ['ETag'],
           maxAge: 3000,
         },
       ],
     });
 
-    // ─── 15. CloudFront Cache Policies ─────────────────────────
-
-    // ✅ CORS headers forwarding policy for API
+    // ─── 14. CloudFront ────────────────────────────────────────
     const corsCachePolicy = new cloudfront.CachePolicy(this, 'CorsApiCachePolicy', {
       cachePolicyName: 'NotesCorsApiPolicy',
       defaultTtl: cdk.Duration.seconds(0),
@@ -337,7 +355,6 @@ export class NotesStack extends cdk.Stack {
       ),
     });
 
-    // ✅ Origin Request Policy — forward CORS headers to API Gateway
     const corsOriginRequestPolicy = new cloudfront.OriginRequestPolicy(
       this,
       'CorsOriginRequestPolicy',
@@ -351,18 +368,14 @@ export class NotesStack extends cdk.Stack {
       }
     );
 
-    // ─── 16. CloudFront Distribution ───────────────────────────
     const distribution = new cloudfront.Distribution(this, 'NotesDistribution', {
       defaultBehavior: {
-        // ✅ S3 default — serves Angular app
         origin: origins.S3BucketOrigin.withOriginAccessControl(webBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
       },
-
       additionalBehaviors: {
-        // ✅ API calls → API Gateway with CORS headers forwarded
         '/api/*': {
           origin: new origins.HttpOrigin(
             `${api.restApiId}.execute-api.eu-north-1.amazonaws.com`,
@@ -373,8 +386,6 @@ export class NotesStack extends cdk.Stack {
           originRequestPolicy: corsOriginRequestPolicy,
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
         },
-
-        // ✅ Scalar docs → API Gateway
         '/scalar': {
           origin: new origins.HttpOrigin(
             `${api.restApiId}.execute-api.eu-north-1.amazonaws.com`,
@@ -385,8 +396,6 @@ export class NotesStack extends cdk.Stack {
           originRequestPolicy: corsOriginRequestPolicy,
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
         },
-
-        // ✅ Scalar assets → API Gateway
         '/scalar/*': {
           origin: new origins.HttpOrigin(
             `${api.restApiId}.execute-api.eu-north-1.amazonaws.com`,
@@ -398,7 +407,6 @@ export class NotesStack extends cdk.Stack {
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
         },
       },
-
       defaultRootObject: 'index.html',
       errorResponses: [
         {
