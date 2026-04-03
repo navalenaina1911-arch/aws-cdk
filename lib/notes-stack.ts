@@ -17,7 +17,7 @@ export class NotesStack extends cdk.Stack {
     super(scope, id, props);
 
     const ECR_REPO = '119287771917.dkr.ecr.eu-north-1.amazonaws.com/notes-application';
-    const CDN_ORIGIN = 'https://d2wykjblakn5u7.cloudfront.net';
+    const CDN_ORIGIN = 'https://d1q6rp644iikc2.cloudfront.net';
 
     // ─── 1. VPC ────────────────────────────────────────────────
     const vpc = new ec2.Vpc(this, 'NotesVpc', {
