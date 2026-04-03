@@ -204,34 +204,24 @@ export class NotesStack extends cdk.Stack {
     });
 
     // ─── 12. API GATEWAY ───────────────────────────────────────
-    const api = new apigateway.RestApi(this, 'NotesApiGateway', {
-      restApiName: 'notes-api-gateway',
-      description: 'API Gateway for Notes Application',
-      defaultCorsPreflightOptions: {
-        allowOrigins: [CDN_ORIGIN],
-        allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: [
-          'Content-Type',
-          'Authorization',
-          'X-Amz-Date',
-          'X-Api-Key',
-          'X-Amz-Security-Token',
-          'Origin',
-          'Accept',
-        ],
-        allowCredentials: true,
-        maxAge: cdk.Duration.days(1),
-      },
-      deployOptions: {
-        stageName: 'dev',
-        throttlingRateLimit: 33,
-        throttlingBurstLimit: 500,
-        loggingLevel: apigateway.MethodLoggingLevel.INFO,
-        metricsEnabled: true,
-        dataTraceEnabled: true,
-      },
-    });
-
+   const api = new apigateway.RestApi(this, 'NotesApiGateway', {
+  restApiName: 'notes-api-gateway',
+  description: 'API Gateway for Notes Application',
+  defaultCorsPreflightOptions: {
+    allowOrigins: apigateway.Cors.ALL_ORIGINS,  // ✅ allow all origins
+    allowMethods: apigateway.Cors.ALL_METHODS,
+    allowHeaders: apigateway.Cors.DEFAULT_HEADERS,
+    allowCredentials: false,  // ✅ must be false with ALL_ORIGINS
+  },
+  deployOptions: {
+    stageName: 'dev',
+    throttlingRateLimit: 33,
+    throttlingBurstLimit: 500,
+    loggingLevel: apigateway.MethodLoggingLevel.INFO,
+    metricsEnabled: true,
+    dataTraceEnabled: true,
+  },
+});
     // ─── ALB Integration ───────────────────────────────────────
     const albIntegration = new apigateway.HttpIntegration(
       `http://${alb.loadBalancerDnsName}/{proxy}`,
